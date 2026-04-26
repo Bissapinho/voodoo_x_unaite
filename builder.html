@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Castle Clasher — Builder</title>
+  <!--
+    STRATEGIE D'INJECTION : Option A hybride
+    - config.parameters (ligne 510) : textes, couleurs, difficulté, store links, redirections
+      → Remplacement regex ciblé sur le HTML source brut (chaque clé a un pattern stable)
+    - GAME_CONFIG (ligne 550) : physique, HP joueur/ennemi, vitesses
+      → Remplacement regex ciblé sur les valeurs numériques
+    - Aucun MRAID : le playable utilise MiniVSDK avec window.open() — pas de mock nécessaire
+    - Assets (portraits, armes, hand) : base64 inline dans CHAR_PORTRAIT_SRCS / CHAR_WEAPON_SRCS
+      → Remplacement du data URI dans le tableau correspondant
+    - Fichier cible : generated-playable-embedded.html (fallback : file input)
+  -->
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg0: #0d0f1a;
+      --bg1: #13152a;
+      --bg2: #1a1d35;
+      --bg3: #22263e;
+      --border: #2e3255;
+      --accent: #6c5ce7;
+      --accent2: #00d2d3;
+      --warn: #f0a500;
+      --err: #ff5370;
+      --ok: #29d172;
+      --txt: #e4e6f0;
+      --txt2: #8890b5;
+      --txt3: #555e88;
+      --mono: 'Cascadia Code', 'Fira Mono', 'Consolas', monospace;
+      --sans: Arial, Helvetica, sans-serif;
+      --sidebar: 290px;
+      --header: 48px;
+    }
+
+    html, body { height: 100%; background: var(--bg0); color: var(--txt); font-family: var(--sans); font-size: 13px; overflow: hidden; }
+
+    /* ── HEADER ──────────────────────────────────────────── */
+    #header {
+      position: fixed; top: 0; left: 0; right: 0; height: var(--header);
+      background: var(--bg1); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 10px; padding: 0 12px;
+      z-index: 100;
+    }
+    #header .logo { font-weight: 900; font-size: 14px; letter-spacing: 0.04em; color: var(--txt); white-space: nowrap; }
+    #header .logo span { color: var(--accent); }
+    #size-badge {
+      font-family: var(--mono); font-size: 11px; padding: 3px 8px;
+      border-radius: 4px; background: var(--bg3); border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    #compliance-badge {
+      font-size: 11px; font-weight: 700; padding: 3px 8px;
+      border-radius: 4px; white-space: nowrap;
+    }
+    #compliance-badge.ok  { background: rgba(41,209,114,0.12); border: 1px solid var(--ok);  color: var(--ok);  }
+    #compliance-badge.warn{ background: rgba(240,165,0,0.12);  border: 1px solid var(--warn); color: var(--warn);}
+    #compliance-badge.err { background: rgba(255,83,112,0.12); border: 1px solid var(--err);  color: var(--err); }
+    .spacer { flex: 1; }
+    .btn {
+      font-size: 12px; font-weight: 700; padding: 0 14px; height: 30px;
+      border-radius: 5px; border: 1px solid var(--border); cursor: pointer;
+      background: var(--bg3); color: var(--txt); letter-spacing: 0.02em;
+      white-space: nowrap; transition: background 80ms, border-color 80ms;
+    }
+    .btn:hover { background: var(--bg2); border-color: var(--accent); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn.primary:hover { background: #7d6eec; }
+    .btn.primary:disabled { background: var(--bg3); border-color: var(--border); color: var(--txt3); cursor: not-allowed; }
+    #load-file-btn { position: relative; overflow: hidden; }
+    #load-file-btn input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+
+    /* ── LAYOUT ──────────────────────────────────────────── */
+    #layout {
+      position: fixed; top: var(--header); left: 0; right: 0; bottom: 0;
+      display: flex;
+    }
+
+    /* ── SIDEBAR ─────────────────────────────────────────── */
+    #sidebar {
+      width: var(--sidebar); flex-shrink: 0;
+      background: var(--bg1); border-right: 1px solid var(--border);
+      overflow-y: auto; overflow-x: hidden;
+    }
+    #sidebar::-webkit-scrollbar { width: 5px; }
+    #sidebar::-webkit-scrollbar-track { background: transparent; }
+    #sidebar::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 3px; }
+
+    .section { border-bottom: 1px solid var(--border); }
+    .section-head {
+      display: flex; align-items: center; gap: 6px;
+      padding: 9px 12px; cursor: pointer; user-select: none;
+      font-weight: 700; font-size: 11px; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--txt2);
+    }
+    .section-head:hover { background: var(--bg2); color: var(--txt); }
+    .section-head .arrow { margin-left: auto; font-size: 9px; transition: transform 150ms; }
+    .section-head.open .arrow { transform: rotate(90deg); }
+    .section-body { padding: 8px 10px 10px; display: none; }
+    .section-body.open { display: block; }
+
+    .field { margin-bottom: 9px; }
+    .field:last-child { margin-bottom: 0; }
+    .field label { display: block; font-size: 11px; color: var(--txt2); margin-bottom: 3px; font-weight: 600; }
+
+    input[type=text], input[type=url], input[type=number], textarea, select {
+      width: 100%; background: var(--bg0); border: 1px solid var(--border);
+      color: var(--txt); font-family: var(--mono); font-size: 12px;
+      padding: 5px 8px; border-radius: 4px; outline: none;
+    }
+    input[type=text]:focus, input[type=url]:focus, input[type=number]:focus,
+    textarea:focus, select:focus {
+      border-color: var(--accent);
+    }
+    input[type=number] { font-family: var(--mono); }
+    textarea { resize: vertical; min-height: 50px; }
+
+    .color-row { display: flex; gap: 6px; align-items: center; }
+    .color-row input[type=color] { width: 32px; height: 28px; border: 1px solid var(--border); border-radius: 4px; padding: 2px; background: var(--bg0); cursor: pointer; flex-shrink: 0; }
+    .color-row input[type=text] { flex: 1; }
+
+    .range-row { display: flex; gap: 8px; align-items: center; }
+    .range-row input[type=range] { flex: 1; accent-color: var(--accent); }
+    .range-row .val { font-family: var(--mono); font-size: 12px; color: var(--accent2); min-width: 36px; text-align: right; }
+
+    /* toggle */
+    .toggle-row { display: flex; align-items: center; gap: 8px; }
+    .toggle-row label { flex: 1; font-size: 11px; color: var(--txt2); font-weight: 600; margin: 0; }
+    .toggle { position: relative; display: inline-block; width: 34px; height: 18px; flex-shrink: 0; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider { position: absolute; inset: 0; background: var(--bg3); border-radius: 18px; cursor: pointer; transition: background 150ms; border: 1px solid var(--border); }
+    .toggle-slider:before { content: ''; position: absolute; left: 2px; top: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--txt3); transition: transform 150ms, background 150ms; }
+    .toggle input:checked + .toggle-slider { background: var(--accent); border-color: var(--accent); }
+    .toggle input:checked + .toggle-slider:before { transform: translateX(16px); background: #fff; }
+
+    .diff-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--txt3); margin-top: 2px; }
+
+    .asset-field { border: 1px dashed var(--border); border-radius: 4px; padding: 8px; background: var(--bg0); }
+    .asset-field label.upload-label { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--txt2); font-size: 11px; font-weight: 600; }
+    .asset-field input[type=file] { display: none; }
+    .asset-field .thumb { width: 36px; height: 36px; border-radius: 4px; object-fit: cover; border: 1px solid var(--border); display: none; }
+    .asset-field .asset-info { font-family: var(--mono); font-size: 10px; color: var(--txt3); margin-top: 4px; }
+    .asset-warn { color: var(--warn); font-size: 10px; margin-top: 3px; }
+
+    .hint { font-size: 10px; color: var(--txt3); margin-top: 3px; }
+
+    /* ── MAIN / PREVIEW ──────────────────────────────────── */
+    #main {
+      flex: 1; display: flex; flex-direction: column;
+      background: var(--bg0); overflow: hidden;
+    }
+    #device-bar {
+      height: 36px; flex-shrink: 0;
+      background: var(--bg1); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 6px; padding: 0 12px;
+    }
+    .dev-btn {
+      font-size: 11px; font-weight: 700; padding: 3px 10px;
+      border-radius: 4px; border: 1px solid var(--border);
+      background: var(--bg3); color: var(--txt2); cursor: pointer;
+    }
+    .dev-btn:hover { border-color: var(--accent); color: var(--txt); }
+    .dev-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    #status-msg { margin-left: auto; font-size: 11px; color: var(--txt3); font-family: var(--mono); }
+
+    #preview-wrap {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      overflow: hidden; padding: 16px;
+    }
+    .device-frame {
+      border-radius: 18px; overflow: hidden;
+      border: 2px solid var(--border);
+      box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+      background: #000;
+      transition: width 200ms, height 200ms;
+      flex-shrink: 0;
+    }
+    #preview-iframe {
+      display: block; border: none;
+      width: 100%; height: 100%;
+    }
+
+    /* ── LOADING OVERLAY ─────────────────────────────────── */
+    #overlay {
+      position: fixed; inset: 0; background: var(--bg0);
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 16px; z-index: 200;
+    }
+    #overlay h2 { font-size: 18px; font-weight: 900; }
+    #overlay p { color: var(--txt2); font-size: 13px; max-width: 340px; text-align: center; line-height: 1.5; }
+    #overlay .err-msg { color: var(--err); font-family: var(--mono); font-size: 12px; max-width: 400px; text-align: center; }
+    #overlay.hidden { display: none; }
+
+    select option { background: var(--bg1); }
+  </style>
+</head>
+<body>
+
+<!-- LOADING OVERLAY -->
+<div id="overlay">
+  <h2>Castle Clasher — Builder</h2>
+  <p id="overlay-msg">Chargement de <code>generated-playable-embedded.html</code>…</p>
+  <div id="overlay-err" class="err-msg" style="display:none"></div>
+  <div style="display:flex;gap:8px;margin-top:4px">
+    <button class="btn load-file-trigger" onclick="document.getElementById('file-input-overlay').click()">Charger un fichier</button>
+    <input type="file" id="file-input-overlay" accept=".html" style="display:none">
+  </div>
+</div>
+
+<!-- HEADER -->
+<div id="header">
+  <div class="logo">Castle Clasher <span>Builder</span></div>
+  <div id="size-badge">— Ko / 5 000 Ko</div>
+  <div id="compliance-badge" class="ok">— AppLovin</div>
+  <div class="spacer"></div>
+  <button class="btn" id="reset-btn">Reset</button>
+  <button class="btn load-file-btn" id="load-file-btn">
+    Charger HTML
+    <input type="file" id="file-input-header" accept=".html">
+  </button>
+  <button class="btn primary" id="export-btn" disabled>Export AppLovin</button>
+</div>
+
+<!-- MAIN LAYOUT -->
+<div id="layout">
+
+  <!-- SIDEBAR -->
+  <div id="sidebar">
+
+    <!-- TEXTES / CTA -->
+    <div class="section">
+      <div class="section-head open" data-section="texts">
+        Textes &amp; CTA <span class="arrow">▶</span>
+      </div>
+      <div class="section-body open" id="sec-texts">
+        <div class="field">
+          <label>Titre du jeu</label>
+          <input type="text" id="p-gameTitle" placeholder="Castle Clasher">
+        </div>
+        <div class="field">
+          <label>Texte tutoriel</label>
+          <input type="text" id="p-tutorialText" placeholder="Drag to aim, release to fire!">
+        </div>
+        <div class="field">
+          <label>Texte victoire</label>
+          <input type="text" id="p-winText" placeholder="Victory!">
+        </div>
+        <div class="field">
+          <label>Texte défaite</label>
+          <input type="text" id="p-loseText" placeholder="Defeated!">
+        </div>
+        <div class="field">
+          <label>Bouton CTA</label>
+          <input type="text" id="p-ctaText" placeholder="Play Now">
+        </div>
+      </div>
+    </div>
+
+    <!-- COULEURS -->
+    <div class="section">
+      <div class="section-head open" data-section="colors">
+        Couleurs <span class="arrow">▶</span>
+      </div>
+      <div class="section-body open" id="sec-colors">
+        <div class="field">
+          <label>Couleur primaire (UI / CTA)</label>
+          <div class="color-row">
+            <input type="color" id="p-primaryColor-picker">
+            <input type="text" id="p-primaryColor" maxlength="7" placeholder="#6C5CE7">
+          </div>
+        </div>
+        <div class="field">
+          <label>Couleur secondaire (gradient)</label>
+          <div class="color-row">
+            <input type="color" id="p-secondaryColor-picker">
+            <input type="text" id="p-secondaryColor" maxlength="7" placeholder="#00D2D3">
+          </div>
+        </div>
+        <div class="field" style="margin-top:10px;padding-top:8px;border-top:1px solid #333">
+          <label style="font-weight:700;color:var(--accent)">— Level 2 / Upgrade —</label>
+        </div>
+        <div class="field">
+          <label>Level 2 primaire</label>
+          <div class="color-row">
+            <input type="color" id="p-level2PrimaryColor-picker">
+            <input type="text" id="p-level2PrimaryColor" maxlength="7" placeholder="#FF7A18">
+          </div>
+        </div>
+        <div class="field">
+          <label>Level 2 secondaire</label>
+          <div class="color-row">
+            <input type="color" id="p-level2SecondaryColor-picker">
+            <input type="text" id="p-level2SecondaryColor" maxlength="7" placeholder="#FF3D77">
+          </div>
+        </div>
+        <div class="field">
+          <label>Level 2 ciel haut</label>
+          <div class="color-row">
+            <input type="color" id="p-level2SkyTopColor-picker">
+            <input type="text" id="p-level2SkyTopColor" maxlength="7" placeholder="#2B1055">
+          </div>
+        </div>
+        <div class="field">
+          <label>Level 2 ciel bas</label>
+          <div class="color-row">
+            <input type="color" id="p-level2SkyBottomColor-picker">
+            <input type="text" id="p-level2SkyBottomColor" maxlength="7" placeholder="#7597DE">
+          </div>
+        </div>
+        <div class="field">
+          <label>Level 2 sol haut</label>
+          <div class="color-row">
+            <input type="color" id="p-level2GroundTopColor-picker">
+            <input type="text" id="p-level2GroundTopColor" maxlength="7" placeholder="#5A2A83">
+          </div>
+        </div>
+        <div class="field">
+          <label>Level 2 sol bas</label>
+          <div class="color-row">
+            <input type="color" id="p-level2GroundBottomColor-picker">
+            <input type="text" id="p-level2GroundBottomColor" maxlength="7" placeholder="#1E163F">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- GAMEPLAY -->
+    <div class="section">
+      <div class="section-head open" data-section="gameplay">
+        Gameplay <span class="arrow">▶</span>
+      </div>
+      <div class="section-body open" id="sec-gameplay">
+        <div class="field">
+          <label>Difficulté</label>
+          <div class="range-row">
+            <input type="range" id="p-difficulty" min="0" max="2" step="1" value="1">
+            <span class="val" id="p-difficulty-val">Medium</span>
+          </div>
+          <div class="diff-labels"><span>Easy</span><span>Medium</span><span>Hard</span></div>
+        </div>
+        <div class="field">
+          <label>HP joueur</label>
+          <div class="range-row">
+            <input type="range" id="p-playerHp" min="10" max="500" step="10" value="100">
+            <span class="val" id="p-playerHp-val">100</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>HP ennemi (medium)</label>
+          <div class="range-row">
+            <input type="range" id="p-enemyHp" min="10" max="500" step="10" value="100">
+            <span class="val" id="p-enemyHp-val">100</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Vitesse projectile</label>
+          <div class="range-row">
+            <input type="range" id="p-projectileSpeed" min="4" max="30" step="1" value="12">
+            <span class="val" id="p-projectileSpeed-val">12</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Gravité</label>
+          <div class="range-row">
+            <input type="range" id="p-gravity" min="0.05" max="1.2" step="0.05" value="0.3">
+            <span class="val" id="p-gravity-val">0.30</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Rayon de drag max</label>
+          <div class="range-row">
+            <input type="range" id="p-maxDragRadius" min="30" max="200" step="5" value="80">
+            <span class="val" id="p-maxDragRadius-val">80</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Délai tir ennemi (ms)</label>
+          <div class="range-row">
+            <input type="range" id="p-turnDelay" min="200" max="4000" step="100" value="1200">
+            <span class="val" id="p-turnDelay-val">1200</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Personnages visibles (château joueur)</label>
+          <div class="range-row">
+            <input type="range" id="p-visiblePlayerCharacters" min="1" max="3" step="1" value="3">
+            <span class="val" id="p-visiblePlayerCharacters-val">3</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- APPLOVIN / STORE -->
+    <div class="section">
+      <div class="section-head open" data-section="store">
+        AppLovin / Store <span class="arrow">▶</span>
+      </div>
+      <div class="section-body open" id="sec-store">
+        <div class="field">
+          <label>URL iOS App Store</label>
+          <input type="url" id="p-iosUrl" placeholder="https://apps.apple.com/…">
+        </div>
+        <div class="field">
+          <label>URL Google Play</label>
+          <input type="url" id="p-androidUrl" placeholder="https://play.google.com/…">
+        </div>
+        <div class="field">
+          <label>Redirect après N clics (0 = désactivé)</label>
+          <div class="range-row">
+            <input type="range" id="p-afterXClicks" min="0" max="20" step="1" value="0">
+            <span class="val" id="p-afterXClicks-val">0</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Redirect après N secondes (0 = désactivé)</label>
+          <div class="range-row">
+            <input type="range" id="p-afterXSeconds" min="0" max="120" step="5" value="0">
+            <span class="val" id="p-afterXSeconds-val">0</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ASSETS -->
+    <div class="section">
+      <div class="section-head" data-section="assets">
+        Assets (portraits) <span class="arrow">▶</span>
+      </div>
+      <div class="section-body" id="sec-assets">
+        <p class="hint" style="margin-bottom:8px">Remplace les portraits des personnages. Format PNG/WebP recommandé, 44×44px min.</p>
+        <div class="field">
+          <label>Portrait Cyclops (index 0)</label>
+          <div class="asset-field">
+            <label class="upload-label">
+              <img class="thumb" id="thumb-portrait-0" src="" alt="">
+              <span id="label-portrait-0">Choisir une image…</span>
+              <input type="file" id="asset-portrait-0" accept="image/*">
+            </label>
+            <div class="asset-info" id="info-portrait-0"></div>
+            <div class="asset-warn" id="warn-portrait-0" style="display:none">⚠ Fichier > 1 Mo</div>
+          </div>
+        </div>
+        <div class="field">
+          <label>Portrait Goblin (index 1)</label>
+          <div class="asset-field">
+            <label class="upload-label">
+              <img class="thumb" id="thumb-portrait-1" src="" alt="">
+              <span id="label-portrait-1">Choisir une image…</span>
+              <input type="file" id="asset-portrait-1" accept="image/*">
+            </label>
+            <div class="asset-info" id="info-portrait-1"></div>
+            <div class="asset-warn" id="warn-portrait-1" style="display:none">⚠ Fichier > 1 Mo</div>
+          </div>
+        </div>
+        <div class="field">
+          <label>Portrait Skeleton (index 2)</label>
+          <div class="asset-field">
+            <label class="upload-label">
+              <img class="thumb" id="thumb-portrait-2" src="" alt="">
+              <span id="label-portrait-2">Choisir une image…</span>
+              <input type="file" id="asset-portrait-2" accept="image/*">
+            </label>
+            <div class="asset-info" id="info-portrait-2"></div>
+            <div class="asset-warn" id="warn-portrait-2" style="display:none">⚠ Fichier > 1 Mo</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /sidebar -->
+
+  <!-- MAIN PREVIEW -->
+  <div id="main">
+    <div id="device-bar">
+      <button class="dev-btn" data-w="390"  data-h="844">iPhone 14</button>
+      <button class="dev-btn active" data-w="412" data-h="915">Pixel 7</button>
+      <button class="dev-btn" data-w="820"  data-h="1180">iPad</button>
+      <button class="dev-btn" data-w="0"    data-h="0">Plein écran</button>
+      <button id="toggle-level2-preview" style="margin-left:12px;background:#2B1055;color:#a78bfa;border:1px solid #5A2A83;border-radius:4px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit">Preview : Level 1</button>
+      <span id="status-msg"></span>
+    </div>
+    <div id="preview-wrap">
+      <div class="device-frame" id="device-frame">
+        <iframe id="preview-iframe" sandbox="allow-scripts allow-same-origin"></iframe>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /layout -->
+
+<script>
+'use strict';
+
+// ── STATE ──────────────────────────────────────────────────────────────────
+const STORAGE_KEY = 'builder_state_v1';
+const PLAYABLE_FILENAMES = ['generated-playable-embedded.html', 'playable_example.html'];
+const MAX_SIZE_BYTES   = 5 * 1024 * 1024;
+const WARN_SIZE_BYTES  = 3 * 1024 * 1024;
+const DIFF_LABELS = ['Easy', 'Medium', 'Hard'];
+
+let originalHtml = null;   // raw source string
+let debounceTimer = null;
+let currentDevice = { w: 412, h: 915 };
+let portraitOverrides = [null, null, null]; // base64 data URIs or null
+
+const DEFAULTS = {
+  gameTitle:       'Castle Clasher',
+  tutorialText:    'Drag to aim, release to fire!',
+  winText:         'Victory!',
+  loseText:        'Defeated!',
+  ctaText:         'Play Now',
+  primaryColor:    '#6C5CE7',
+  secondaryColor:  '#00D2D3',
+  level2PrimaryColor:    '#FF7A18',
+  level2SecondaryColor:  '#FF3D77',
+  level2SkyTopColor:     '#2B1055',
+  level2SkyBottomColor:  '#7597DE',
+  level2GroundTopColor:  '#5A2A83',
+  level2GroundBottomColor: '#1E163F',
+  difficulty:      1,
+  playerHp:        100,
+  enemyHp:         100,
+  projectileSpeed: 12,
+  gravity:         0.3,
+  maxDragRadius:   80,
+  turnDelay:       1200,
+  visiblePlayerCharacters: 3,
+  iosUrl:          'https://play.google.com/store/apps/details?id=com.epicoro.castleclashers',
+  androidUrl:      'https://play.google.com/store/apps/details?id=com.epicoro.castleclashers',
+  afterXClicks:    0,
+  afterXSeconds:   0,
+};
+
+let state = { ...DEFAULTS };
+
+// ── INJECTION ─────────────────────────────────────────────────────────────
+// Replaces a config.parameters string value: key: { value: "..." }
+function replaceConfigStr(html, key, val) {
+  const safe = val.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return html.replace(
+    new RegExp(`(${key}:\\s*\\{\\s*value:\\s*)"[^"]*"`, 'm'),
+    `$1"${safe}"`
+  );
+}
+
+// Replaces a config.parameters numeric value: key: { value: N }
+function replaceConfigNum(html, key, val) {
+  return html.replace(
+    new RegExp(`(${key}:\\s*\\{\\s*value:\\s*)\\d+(\\.\\d+)?`, 'm'),
+    `$1${val}`
+  );
+}
+
+// Replaces a GAME_CONFIG numeric value (careful: scoped by proximity)
+function replaceGameNum(html, key, val) {
+  return html.replace(
+    new RegExp(`(\\b${key}:\\s*)[\\d.]+`, 'm'),
+    `$1${val}`
+  );
+}
+
+// Replaces a store link URL by platform
+function replaceStoreUrl(html, store, url) {
+  const safeUrl = url.replace(/"/g, '\\"');
+  return html.replace(
+    new RegExp(`(store:\\s*"${store}"[^}]*?url:\\s*)"[^"]*"`, 's'),
+    `$1"${safeUrl}"`
+  );
+}
+
+// Replaces a portrait data URI in CHAR_PORTRAIT_SRCS array (index 0/1/2)
+function replacePortrait(html, index, dataUri) {
+  // CHAR_PORTRAIT_SRCS = ["data:...", "data:...", "data:..."]
+  // Strategy: split on CHAR_PORTRAIT_SRCS, then replace the Nth data URI entry
+  const marker = 'CHAR_PORTRAIT_SRCS = [';
+  const pos = html.indexOf(marker);
+  if (pos === -1) return html;
+
+  const before = html.slice(0, pos + marker.length);
+  const rest   = html.slice(pos + marker.length);
+  // Find end of the array
+  const closeBracket = rest.indexOf('];');
+  if (closeBracket === -1) return html;
+
+  const arrStr   = rest.slice(0, closeBracket);
+  const afterArr = rest.slice(closeBracket);
+
+  // Split on quoted entries (data URIs are quoted strings)
+  let count = 0;
+  const newArrStr = arrStr.replace(/"(data:[^"]*)"/g, (match, uri) => {
+    if (count === index) {
+      count++;
+      return `"${dataUri}"`;
+    }
+    count++;
+    return match;
+  });
+
+  return before + newArrStr + afterArr;
+}
+
+function applyParams(html, st, portraits) {
+  let out = html;
+
+  // config.parameters texts
+  out = replaceConfigStr(out, 'gameTitle',    st.gameTitle);
+  out = replaceConfigStr(out, 'tutorialText', st.tutorialText);
+  out = replaceConfigStr(out, 'winText',      st.winText);
+  out = replaceConfigStr(out, 'loseText',     st.loseText);
+  out = replaceConfigStr(out, 'ctaText',      st.ctaText);
+
+  // config.parameters colors
+  out = replaceConfigStr(out, 'primaryColor',   st.primaryColor);
+  out = replaceConfigStr(out, 'secondaryColor', st.secondaryColor);
+  out = replaceConfigStr(out, 'level2PrimaryColor',    st.level2PrimaryColor);
+  out = replaceConfigStr(out, 'level2SecondaryColor',  st.level2SecondaryColor);
+  out = replaceConfigStr(out, 'level2SkyTopColor',     st.level2SkyTopColor);
+  out = replaceConfigStr(out, 'level2SkyBottomColor',  st.level2SkyBottomColor);
+  out = replaceConfigStr(out, 'level2GroundTopColor',  st.level2GroundTopColor);
+  out = replaceConfigStr(out, 'level2GroundBottomColor', st.level2GroundBottomColor);
+
+  // config.parameters difficulty
+  out = replaceConfigNum(out, 'difficulty', st.difficulty);
+
+  // config.redirections
+  out = out.replace(/(afterXClicks:\s*\{\s*value:\s*)\d+/m,  `$1${st.afterXClicks}`);
+  out = out.replace(/(afterXReleases:\s*\{\s*value:\s*)\d+/m,`$10`);
+  out = out.replace(/(afterXSeconds:\s*\{\s*value:\s*)\d+/m,  `$1${st.afterXSeconds}`);
+
+  // config.parameters redirections top-level (autoRedirectAfterClicks / Seconds)
+  out = out.replace(/(autoRedirectAfterClicks:\s*\{\s*value:\s*)\d+/m, `$1${st.afterXClicks}`);
+  out = out.replace(/(autoRedirectAfterSeconds:\s*\{\s*value:\s*)\d+/m,`$1${st.afterXSeconds}`);
+
+  // store links
+  out = replaceStoreUrl(out, 'APP_STORE',  st.iosUrl);
+  out = replaceStoreUrl(out, 'PLAY_STORE', st.androidUrl);
+
+  // GAME_CONFIG
+  out = replaceGameNum(out, 'gravity',         st.gravity.toFixed(2));
+  out = replaceGameNum(out, 'projectileSpeed', st.projectileSpeed);
+  out = replaceGameNum(out, 'maxDragRadius',   st.maxDragRadius);
+  out = replaceGameNum(out, 'turnDelay',       st.turnDelay);
+
+  // visible player characters
+  out = out.replace(/(const PLAYER_VISIBLE_CHARACTERS\s*=\s*)\d+/, `$1${st.visiblePlayerCharacters}`);
+
+  // player hp — careful: "hp: 100" appears in multiple contexts
+  // Scope to player: { hp: ... } block
+  out = out.replace(/(player:\s*\{\s*hp:\s*)\d+/, `$1${st.playerHp}`);
+
+  // enemy medium hp in difficulty block
+  out = out.replace(/(medium:\s*\{\s*enemyHp:\s*)\d+/, `$1${st.enemyHp}`);
+  // Also update enemy base hp (used for state.maxEnemyHp initial)
+  out = out.replace(/(enemy:\s*\{\s*hp:\s*)\d+/, `$1${st.enemyHp}`);
+
+  // portrait overrides
+  for (let i = 0; i < 3; i++) {
+    if (portraits[i]) {
+      out = replacePortrait(out, i, portraits[i]);
+    }
+  }
+
+  return out;
+}
+
+// ── PREVIEW ───────────────────────────────────────────────────────────────
+let previewLevel2 = false;
+
+document.getElementById('toggle-level2-preview').addEventListener('click', () => {
+  previewLevel2 = !previewLevel2;
+  const btn = document.getElementById('toggle-level2-preview');
+  if (previewLevel2) {
+    btn.textContent = 'Preview : Level 2';
+    btn.style.background = '#FF7A18';
+    btn.style.color = '#fff';
+    btn.style.borderColor = '#FF3D77';
+  } else {
+    btn.textContent = 'Preview : Level 1';
+    btn.style.background = '#2B1055';
+    btn.style.color = '#a78bfa';
+    btn.style.borderColor = '#5A2A83';
+  }
+  scheduleUpdate();
+});
+
+const LEVEL2_JUMP_SCRIPT = `<script>
+(function() {
+  var _check = setInterval(function() {
+    try {
+      var rt = window.__MiniVSDKRuntime;
+      if (rt && rt.playable && rt.playable.resetForLevel && rt.playable.state && rt.playable.state.level === 1 && !rt.playable.levelTransitioning) {
+        clearInterval(_check);
+        rt.playable.resetForLevel(2, false);
+        rt.playable.applyLevelTheme && rt.playable.applyLevelTheme();
+      }
+    } catch(e) {}
+  }, 80);
+  setTimeout(function() { clearInterval(_check); }, 10000);
+})();
+<\/script>`;
+
+function injectLevel2Preview(html) {
+  return html.replace('</head>', LEVEL2_JUMP_SCRIPT + '</head>');
+}
+
+function scheduleUpdate() {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(updatePreview, 150);
+}
+
+function updatePreview() {
+  if (!originalHtml) return;
+  let modified = applyParams(originalHtml, state, portraitOverrides);
+  if (previewLevel2) modified = injectLevel2Preview(modified);
+  const iframe = document.getElementById('preview-iframe');
+  iframe.srcdoc = modified;
+  updateSizeBadge(modified);
+  saveToStorage();
+  document.getElementById('status-msg').textContent = 'Mis à jour · ' + new Date().toLocaleTimeString();
+}
+
+function updateSizeBadge(html) {
+  const bytes = new Blob([html]).size;
+  const ko = Math.round(bytes / 1024);
+  const maxKo = Math.round(MAX_SIZE_BYTES / 1024);
+  document.getElementById('size-badge').textContent = `${ko.toLocaleString()} Ko / ${maxKo.toLocaleString()} Ko`;
+
+  const badge = document.getElementById('compliance-badge');
+  if (bytes > MAX_SIZE_BYTES) {
+    badge.className = 'err'; badge.textContent = '⚠ Trop lourd (>5 Mo)';
+  } else if (bytes > WARN_SIZE_BYTES) {
+    badge.className = 'warn'; badge.textContent = '⚠ AppLovin (>3 Mo)';
+  } else {
+    badge.className = 'ok'; badge.textContent = '✓ AppLovin OK';
+  }
+}
+
+// ── EXPORT ────────────────────────────────────────────────────────────────
+document.getElementById('export-btn').addEventListener('click', () => {
+  if (!originalHtml) return;
+  const modified = applyParams(originalHtml, state, portraitOverrides);
+  const bytes = new Blob([modified]).size;
+
+  if (bytes > MAX_SIZE_BYTES) {
+    const heavyAssets = getHeavyAssets(modified);
+    alert(`Export bloqué : fichier trop lourd (${Math.round(bytes/1024)} Ko / 5000 Ko max).\n\nAssets les plus lourds :\n${heavyAssets.join('\n')}`);
+    return;
+  }
+
+  if (bytes > WARN_SIZE_BYTES) {
+    if (!confirm(`Le fichier fait ${Math.round(bytes/1024)} Ko (>3 Mo recommandé).\nAppLovin peut le rejeter. Exporter quand même ?`)) return;
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const filename = `playable_built_${ts}.html`;
+  const blob = new Blob([modified], { type: 'text/html' });
+  const url  = URL.createObjectURL(blob);
+  const a = Object.assign(document.createElement('a'), { href: url, download: filename });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+});
+
+function getHeavyAssets(html) {
+  const matches = [];
+  const re = /data:image\/([^;]+);base64,([A-Za-z0-9+/=]+)/g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const kb = Math.round(m[2].length * 0.75 / 1024);
+    if (kb > 50) matches.push(`• Image ${m[1]}: ~${kb} Ko`);
+  }
+  return matches.slice(0, 8);
+}
+
+// ── LOAD HTML ─────────────────────────────────────────────────────────────
+async function tryAutoLoad() {
+  for (const name of PLAYABLE_FILENAMES) {
+    try {
+      const resp = await fetch(name, { cache: 'no-store' });
+      if (!resp.ok) continue;
+      const text = await resp.text();
+      if (text.trim().startsWith('<!')) {
+        onHtmlLoaded(text, name);
+        return;
+      }
+    } catch (_) {}
+  }
+  // fallback
+  showOverlayError(`Fichier introuvable automatiquement.\nChargez manuellement : ${PLAYABLE_FILENAMES.join(' ou ')}`);
+}
+
+function onHtmlLoaded(html, name) {
+  originalHtml = html;
+  document.getElementById('overlay').classList.add('hidden');
+  document.getElementById('export-btn').disabled = false;
+  document.title = `Builder — ${name}`;
+
+  // Load state from storage or defaults
+  const saved = loadFromStorage();
+  state = saved ? { ...DEFAULTS, ...saved } : { ...DEFAULTS };
+  populateUI();
+  updatePreview();
+}
+
+function showOverlayError(msg) {
+  document.getElementById('overlay-msg').textContent = '';
+  const err = document.getElementById('overlay-err');
+  err.style.display = 'block';
+  err.textContent = msg;
+}
+
+// File input handlers
+function handleFileInput(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const html = e.target.result;
+    if (!html.trim().startsWith('<!')) {
+      alert('Ce fichier ne semble pas être un HTML valide.');
+      return;
+    }
+    onHtmlLoaded(html, file.name);
+  };
+  reader.readAsText(file);
+}
+
+document.getElementById('file-input-overlay').addEventListener('change', (e) => {
+  handleFileInput(e.target.files[0]);
+});
+document.getElementById('file-input-header').addEventListener('change', (e) => {
+  handleFileInput(e.target.files[0]);
+});
+
+// ── RESET ─────────────────────────────────────────────────────────────────
+document.getElementById('reset-btn').addEventListener('click', () => {
+  if (!confirm('Réinitialiser tous les paramètres aux valeurs d\'origine ?')) return;
+  state = { ...DEFAULTS };
+  portraitOverrides = [null, null, null];
+  // Reset asset UI
+  for (let i = 0; i < 3; i++) {
+    document.getElementById(`thumb-portrait-${i}`).style.display = 'none';
+    document.getElementById(`label-portrait-${i}`).textContent = 'Choisir une image…';
+    document.getElementById(`info-portrait-${i}`).textContent = '';
+    document.getElementById(`warn-portrait-${i}`).style.display = 'none';
+    document.getElementById(`asset-portrait-${i}`).value = '';
+  }
+  populateUI();
+  updatePreview();
+  localStorage.removeItem(STORAGE_KEY);
+});
+
+// ── STORAGE ───────────────────────────────────────────────────────────────
+function saveToStorage() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (_) {}
+}
+function loadFromStorage() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) { return null; }
+}
+
+// ── SECTIONS COLLAPSE ─────────────────────────────────────────────────────
+document.querySelectorAll('.section-head').forEach((head) => {
+  head.addEventListener('click', () => {
+    const key = head.dataset.section;
+    const body = document.getElementById(`sec-${key}`);
+    head.classList.toggle('open');
+    body.classList.toggle('open');
+  });
+});
+
+// ── DEVICE FRAMES ─────────────────────────────────────────────────────────
+const frame = document.getElementById('device-frame');
+const wrap  = document.getElementById('preview-wrap');
+
+function applyDevice(w, h) {
+  currentDevice = { w, h };
+  if (w === 0) {
+    frame.style.width  = '100%';
+    frame.style.height = '100%';
+    frame.style.borderRadius = '0';
+    frame.style.border = 'none';
+  } else {
+    const maxH = wrap.clientHeight - 32;
+    const maxW = wrap.clientWidth  - 32;
+    const scale = Math.min(1, maxW / w, maxH / h);
+    frame.style.width  = Math.round(w * scale) + 'px';
+    frame.style.height = Math.round(h * scale) + 'px';
+    frame.style.borderRadius = '18px';
+    frame.style.border = '2px solid var(--border)';
+  }
+}
+
+document.querySelectorAll('.dev-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.dev-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    applyDevice(+btn.dataset.w, +btn.dataset.h);
+  });
+});
+
+window.addEventListener('resize', () => {
+  applyDevice(currentDevice.w, currentDevice.h);
+});
+
+// ── UI ↔ STATE BINDING ────────────────────────────────────────────────────
+function bindText(id, key) {
+  const el = document.getElementById(id);
+  el.addEventListener('input', () => { state[key] = el.value; scheduleUpdate(); });
+}
+function bindRange(id, key, displayId, fmt) {
+  const el = document.getElementById(id);
+  const disp = document.getElementById(displayId);
+  el.addEventListener('input', () => {
+    state[key] = +el.value;
+    disp.textContent = fmt ? fmt(+el.value) : el.value;
+    scheduleUpdate();
+  });
+}
+function bindColor(id, pickerId, key) {
+  const text = document.getElementById(id);
+  const pick = document.getElementById(pickerId);
+  text.addEventListener('input', () => {
+    const val = text.value;
+    if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+      pick.value = val;
+      state[key] = val;
+      scheduleUpdate();
+    }
+  });
+  pick.addEventListener('input', () => {
+    text.value = pick.value;
+    state[key] = pick.value;
+    scheduleUpdate();
+  });
+}
+
+// Texts
+bindText('p-gameTitle',    'gameTitle');
+bindText('p-tutorialText', 'tutorialText');
+bindText('p-winText',      'winText');
+bindText('p-loseText',     'loseText');
+bindText('p-ctaText',      'ctaText');
+
+// Colors
+bindColor('p-primaryColor',   'p-primaryColor-picker',   'primaryColor');
+bindColor('p-secondaryColor', 'p-secondaryColor-picker', 'secondaryColor');
+bindColor('p-level2PrimaryColor',    'p-level2PrimaryColor-picker',    'level2PrimaryColor');
+bindColor('p-level2SecondaryColor',  'p-level2SecondaryColor-picker',  'level2SecondaryColor');
+bindColor('p-level2SkyTopColor',     'p-level2SkyTopColor-picker',     'level2SkyTopColor');
+bindColor('p-level2SkyBottomColor',  'p-level2SkyBottomColor-picker',  'level2SkyBottomColor');
+bindColor('p-level2GroundTopColor',  'p-level2GroundTopColor-picker',  'level2GroundTopColor');
+bindColor('p-level2GroundBottomColor','p-level2GroundBottomColor-picker','level2GroundBottomColor');
+
+// Gameplay ranges
+bindRange('p-difficulty',      'difficulty',      'p-difficulty-val',      v => DIFF_LABELS[v]);
+bindRange('p-playerHp',        'playerHp',        'p-playerHp-val',        null);
+bindRange('p-enemyHp',         'enemyHp',         'p-enemyHp-val',         null);
+bindRange('p-projectileSpeed', 'projectileSpeed', 'p-projectileSpeed-val', null);
+bindRange('p-gravity',         'gravity',         'p-gravity-val',         v => v.toFixed(2));
+bindRange('p-maxDragRadius',   'maxDragRadius',   'p-maxDragRadius-val',   null);
+bindRange('p-turnDelay',       'turnDelay',       'p-turnDelay-val',       null);
+bindRange('p-visiblePlayerCharacters', 'visiblePlayerCharacters', 'p-visiblePlayerCharacters-val', null);
+
+// Store URLs
+document.getElementById('p-iosUrl').addEventListener('input', (e) => {
+  state.iosUrl = e.target.value; scheduleUpdate();
+});
+document.getElementById('p-androidUrl').addEventListener('input', (e) => {
+  state.androidUrl = e.target.value; scheduleUpdate();
+});
+
+// Redirections
+bindRange('p-afterXClicks',  'afterXClicks',  'p-afterXClicks-val',  null);
+bindRange('p-afterXSeconds', 'afterXSeconds', 'p-afterXSeconds-val', null);
+
+// Assets — portrait overrides
+for (let i = 0; i < 3; i++) {
+  document.getElementById(`asset-portrait-${i}`).addEventListener('change', (function(idx) {
+    return function(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const warnEl = document.getElementById(`warn-portrait-${idx}`);
+      warnEl.style.display = file.size > 1024 * 1024 ? 'block' : 'none';
+
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const dataUri = ev.target.result;
+        portraitOverrides[idx] = dataUri;
+
+        const thumb = document.getElementById(`thumb-portrait-${idx}`);
+        thumb.src = dataUri;
+        thumb.style.display = 'block';
+
+        const kb = Math.round(file.size / 1024);
+        document.getElementById(`label-portrait-${idx}`).textContent = file.name;
+        document.getElementById(`info-portrait-${idx}`).textContent = `${kb} Ko — ${file.type}`;
+
+        scheduleUpdate();
+      };
+      reader.readAsDataURL(file);
+    };
+  })(i));
+}
+
+// ── POPULATE UI FROM STATE ────────────────────────────────────────────────
+function populateUI() {
+  // Text fields
+  document.getElementById('p-gameTitle').value    = state.gameTitle;
+  document.getElementById('p-tutorialText').value = state.tutorialText;
+  document.getElementById('p-winText').value      = state.winText;
+  document.getElementById('p-loseText').value     = state.loseText;
+  document.getElementById('p-ctaText').value      = state.ctaText;
+
+  // Colors
+  document.getElementById('p-primaryColor').value         = state.primaryColor;
+  document.getElementById('p-primaryColor-picker').value  = state.primaryColor;
+  document.getElementById('p-secondaryColor').value       = state.secondaryColor;
+  document.getElementById('p-secondaryColor-picker').value= state.secondaryColor;
+  const setColor = (id, key) => {
+    document.getElementById(id).value          = state[key];
+    document.getElementById(id + '-picker').value = state[key];
+  };
+  setColor('p-level2PrimaryColor',    'level2PrimaryColor');
+  setColor('p-level2SecondaryColor',  'level2SecondaryColor');
+  setColor('p-level2SkyTopColor',     'level2SkyTopColor');
+  setColor('p-level2SkyBottomColor',  'level2SkyBottomColor');
+  setColor('p-level2GroundTopColor',  'level2GroundTopColor');
+  setColor('p-level2GroundBottomColor','level2GroundBottomColor');
+
+  // Ranges
+  const setRange = (id, key, dispId, fmt) => {
+    document.getElementById(id).value = state[key];
+    document.getElementById(dispId).textContent = fmt ? fmt(state[key]) : state[key];
+  };
+  setRange('p-difficulty',      'difficulty',      'p-difficulty-val',      v => DIFF_LABELS[v]);
+  setRange('p-playerHp',        'playerHp',        'p-playerHp-val',        null);
+  setRange('p-enemyHp',         'enemyHp',         'p-enemyHp-val',         null);
+  setRange('p-projectileSpeed', 'projectileSpeed', 'p-projectileSpeed-val', null);
+  setRange('p-gravity',         'gravity',         'p-gravity-val',         v => Number(v).toFixed(2));
+  setRange('p-maxDragRadius',   'maxDragRadius',   'p-maxDragRadius-val',   null);
+  setRange('p-turnDelay',       'turnDelay',       'p-turnDelay-val',       null);
+  setRange('p-visiblePlayerCharacters', 'visiblePlayerCharacters', 'p-visiblePlayerCharacters-val', null);
+  setRange('p-afterXClicks',    'afterXClicks',    'p-afterXClicks-val',    null);
+  setRange('p-afterXSeconds',   'afterXSeconds',   'p-afterXSeconds-val',   null);
+
+  // Store URLs
+  document.getElementById('p-iosUrl').value     = state.iosUrl;
+  document.getElementById('p-androidUrl').value = state.androidUrl;
+}
+
+// ── INIT ──────────────────────────────────────────────────────────────────
+applyDevice(412, 915);
+tryAutoLoad();
+</script>
+</body>
+</html>
